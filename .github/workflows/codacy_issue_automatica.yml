@@ -1,0 +1,168 @@
+name: Codacy CI
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  codacy:
+    runs-on: ubuntu-24.04
+    services:
+      mariadb:
+        image: mariadb:12.0.2
+        env:
+          MARIADB_ROOT_PASSWORD: uvlhub_root_password
+          MARIADB_DATABASE: uvlhubdb_test
+          MARIADB_USER: uvlhub_user
+          MARIADB_PASSWORD: uvlhub_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mariadb-admin ping -u root -p$MARIADB_ROOT_PASSWORD"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.13'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e ./rosemary
+
+    - name: Check for outdated dependencies
+      run: |
+        pip list --outdated > outdated_dependencies.txt
+
+    - name: Show outdated dependencies
+      run: cat outdated_dependencies.txt
+
+    - name: Audit dependencies for security issues
+      id: audit
+      run: |
+        pip install pip-audit
+        pip-audit -o audit_report.json --format json || true
+
+    - name: Show audit report
+      run: |
+        if [ -f audit_report.json ]; then
+            cat audit_report.json
+        else
+            echo "No se encontro audit_report.json."
+        fi
+
+    - name: Prepare notification
+      run: |
+        # Dependencias obsoletas: una por linea, separadas por ";" para poder
+        # pasarlas en una sola variable de entorno.
+        if [ -f outdated_dependencies.txt ]; then
+            outdated=$(awk 'NR>2 {print $1, $2, $3}' outdated_dependencies.txt | tr '\n' ';')
+        else
+            outdated=""
+        fi
+        echo "outdated_dependencies=$outdated" >> $GITHUB_ENV
+
+        # El informe de pip-audit es JSON multilinea. La forma "clave=valor" de
+        # GITHUB_ENV solo admite una linea, asi que hay que usar el delimitador;
+        # sin el, el paso siguiente recibe el JSON truncado y JSON.parse falla.
+        # Si no hay informe se escribe un JSON vacio, no un texto: el consumidor
+        # siempre parsea.
+        {
+          echo "vulnerabilities<<PIP_AUDIT_EOF"
+          if [ -f audit_report.json ]; then
+              cat audit_report.json
+          else
+              echo '{"dependencies": []}'
+          fi
+          echo "PIP_AUDIT_EOF"
+        } >> $GITHUB_ENV
+
+    - name: Create GitHub issue for outdated dependencies and vulnerabilities
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const title = "Notificación de dependencias";
+
+          // Dependencias obsoletas, en tabla.
+          const outdatedDeps = (process.env.outdated_dependencies || "")
+            .split(';')
+            .filter(dep => dep.trim())
+            .map(dep => `| ${dep.trim().split(/\s+/).join(' | ')} |`)
+            .join('\n');
+
+          const outdatedTable = [
+            '| Paquete | Versión instalada | Nueva versión |',
+            '|---------|-------------------|---------------|',
+            outdatedDeps || '| No se encontraron dependencias obsoletas | | |',
+          ].join('\n');
+
+          // Vulnerabilidades, en tabla.
+          const vulnerabilitiesData = JSON.parse(process.env.vulnerabilities);
+          const vulnerableDeps = (vulnerabilitiesData.dependencies || [])
+            .filter(dep => (dep.vulns || []).length > 0);
+
+          const vulnerabilityRows = vulnerableDeps.length > 0
+            ? vulnerableDeps.map(dep =>
+                dep.vulns.map(vuln =>
+                  `| ${dep.name} | ${dep.version} | ${vuln.id} | ${vuln.fix_versions || 'No disponible'} |`
+                ).join('\n')
+              ).join('\n')
+            : '| No se encontraron vulnerabilidades | | | |';
+
+          const vulnsTable = [
+            '| Nombre | Versión | ID | Versión de arreglo |',
+            '|--------|---------|----|--------------------|',
+            vulnerabilityRows,
+          ].join('\n');
+
+          // Sin indentacion: cuatro espacios al principio de linea convierten
+          // la tabla en un bloque de codigo y el issue sale ilegible.
+          const body = [
+            '### Dependencias obsoletas',
+            '',
+            outdatedTable,
+            '',
+            '### Vulnerabilidades encontradas',
+            '',
+            vulnsTable,
+          ].join('\n');
+
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: title,
+            body: body
+          });
+
+    - name: Run tests with coverage
+      run: |
+        coverage run -m pytest app/features/ --ignore-glob='*selenium*'
+        coverage xml
+      env:
+        FLASK_ENV: testing
+        MARIADB_HOSTNAME: 127.0.0.1
+        MARIADB_PORT: 3306
+        MARIADB_TEST_DATABASE: uvlhubdb_test
+        MARIADB_USER: uvlhub_user
+        MARIADB_PASSWORD: uvlhub_password
+
+    # El paquete PyPI codacy-coverage (python-codacy-coverage) esta archivado
+    # desde 2020 y su endpoint ya no existe: se usa el uploader oficial.
+    - name: Upload coverage to Codacy
+      run: bash <(curl -Ls https://coverage.codacy.com/get.sh) report -r coverage.xml
+      env:
+        CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}

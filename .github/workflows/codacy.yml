@@ -1,16 +1,17 @@
 name: Codacy CI
 
 on:
+
   push:
-    branches:
-      - main
-  pull_request:
     branches:
       - main
 
 jobs:
+
   codacy:
+
     runs-on: ubuntu-24.04
+
     services:
       mariadb:
         image: mariadb:12.0.2
@@ -27,14 +28,22 @@ jobs:
           --health-timeout=5s
           --health-retries=3
 
+    # Modificacion 2: comprobar la compatibilidad con varias versiones de Python.
+    # El proyecto declara requires-python = ">=3.13", asi que 3.13 es el suelo y
+    # 3.14 la siguiente: la matriz avisa de la ruptura antes de que toque migrar.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.13', '3.14']
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v5
 
-    - name: Set up Python
+    - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6
       with:
-        python-version: '3.13'
+        python-version: ${{ matrix.python-version }}
 
     - name: Install dependencies
       run: |
@@ -42,6 +51,21 @@ jobs:
         pip install -r requirements.txt
         pip install -e ./rosemary
 
+    # Modificacion 1: buscar versiones nuevas de las dependencias instaladas.
+    # Va DESPUES de instalar requirements.txt: colocado antes solo listaria los
+    # paquetes que el runner trae de serie, que no son los del proyecto.
+    - name: Check for outdated dependencies
+      run: |
+        pip list --outdated
+
+    # Modificacion 3: analisis de seguridad de las dependencias instaladas.
+    - name: Security audit with pip-audit
+      run: |
+        pip install pip-audit
+        pip-audit || true
+
+    # La cobertura se sube una sola vez: con la matriz activa y sin este filtro,
+    # Codacy recibiria dos informes distintos del mismo commit.
     - name: Run tests with coverage
       run: |
         coverage run -m pytest app/features/ --ignore-glob='*selenium*'
@@ -54,7 +78,10 @@ jobs:
         MARIADB_USER: uvlhub_user
         MARIADB_PASSWORD: uvlhub_password
 
+    # El paquete PyPI codacy-coverage (python-codacy-coverage) esta archivado
+    # desde 2020 y su endpoint ya no existe: se usa el uploader oficial.
     - name: Upload coverage to Codacy
+      if: matrix.python-version == '3.13'
       run: bash <(curl -Ls https://coverage.codacy.com/get.sh) report -r coverage.xml
       env:
         CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
